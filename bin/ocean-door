@@ -1,0 +1,159 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+require 'bundler'
+Bundler.setup(:default)
+require 'digest/crc'
+#require 'rocean'
+require 'rubyserial'
+#require 'serialport'
+
+module IQfyDruckSensor
+  def sensor_id
+    @sensor_id ||= @data[3..5].map{|b| sprintf('%02X', b)}.join(' ')
+  end
+
+  def state
+    (((@data[1] >> 4) & 0x01) == 1) ? :down : :up
+  end
+
+  def to_s
+    "#{sensor_id}:#{state}"
+  end
+end
+
+class RadioTelegram
+  def initialize(params = {}) 
+    @data = params[:data] || []
+    @opt_data = params[:opt_data] || []
+    choice_extend(choice)
+  end
+
+  def choice
+    @data[0]
+  end
+
+  def choice_extend(choice)
+    case choice 
+    when 0xF6
+      extend(IQfyDruckSensor)
+    else
+      puts "warn: #{choice} unknown package choice: #{choice}"
+    end
+  end
+end
+
+class PackageParser
+
+  def initialize
+    reset
+  end
+
+  def waiting_for_sync
+    if @bytes.last == 0x55
+      #puts "sync"
+      @state = method(:reading_header)
+    else
+      puts "BAD sync"
+      @bytes = []
+    end
+  end
+
+  def reading_header
+    return unless (@bytes.size == 6)
+
+    checksum_check(@bytes[1..4], @bytes[5])
+
+    @data_size = (((@bytes[1] << 8) & 0xFF00) | @bytes[2])
+    @opt_data_size = @bytes[3]
+    @package_type = @bytes[4]
+    #puts "header complete(#{@package_type}: #{@data_size}, #{@opt_data_size})"
+    #puts "(header) #{@bytes[0..4].map{|b| sprintf(' %02X', b)}.join}"
+
+    @state = method(:reading_data)
+  end
+
+  def reading_data
+    return unless (@bytes.size == 6 + @data_size)
+    #puts "data complete"
+    @data = @bytes[6...(6+@data_size)]
+    @state = method(:reading_opt_data)
+  end
+
+  def reading_opt_data
+    return unless (@bytes.size == 6 + @data_size + @opt_data_size)
+    #puts "opt data complete"
+    @opt_data = @bytes[(6+@data_size)...(6+@data_size+@opt_data_size)]
+    @state = method(:read_package_checksum)
+  end
+
+  def read_package_checksum
+    checksum_check(@bytes[6...(6+@data_size+@opt_data_size)], @bytes.last)
+    #puts "package complete & ok: #{@bytes[6]}"
+    #s1 = @data.map{|b| sprintf(" %02X", b)}.join
+    #s2 = @opt_data.map{|b| sprintf(" %02X", b)}.join
+    #puts "(#{@bytes.size}) #{s1} | #{s2}"
+
+    @on_package && @on_package.call(
+      RadioTelegram.new(data: @data, opt_data: @opt_data)
+    )
+
+    reset
+  end
+
+  def reset
+    @bytes = []
+    @state = method(:waiting_for_sync)
+  end
+
+  def push(byte)
+    @bytes.push(byte)
+    @state.call
+  rescue => e
+    puts "package error: #{e}"
+    reset
+  end
+
+  def on_package(&callback)
+    @on_package = callback
+  end
+
+  def checksum_check(bytes, checksum)
+    digest = Digest::CRC8.checksum(bytes.pack("c*"))
+    unless digest == checksum
+      s = bytes.map{|b| sprintf(" %02X", b)}.join
+      raise "Corrupted Calculated/expected: #{digest}/#{checksum}:\n#{s}"
+    end
+  end
+end
+
+def main(argv)
+  device = argv.shift || "/dev/ttyUSB0"
+  puts "open device: #{device}"
+  #sp = Serial.new(device, nil, nil, baud_rate: 57600, vmin: 2)
+  #sp = SerialPort.new(device, "baud" => 57600)
+  sp = Serial.new(device, 57600)
+  spfd = sp.instance_variable_get("@fd")
+  #spfd = IO.new(sp.instance_variable_get("@fd"))
+  puts "fd: #{spfd}"
+  spfd = IO.new(spfd)
+
+  p = PackageParser.new
+  p.on_package {|iqfy| puts iqfy}
+
+  puts "starting read loop"
+  loop do
+    IO.select([spfd])
+    pkg = sp.read(255)
+    if pkg.size < 1
+      puts " !! empty read!"
+      next
+    end
+
+    s = pkg.bytes.map{|b| sprintf(" %02X", b)}.join
+    puts "(#{pkg.size}) #{s}"
+    pkg.bytes.each {|byte| p.push(byte)}
+  end
+end
+
+main(ARGV)
